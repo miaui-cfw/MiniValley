@@ -1,0 +1,6 @@
+out/
+.sysroot/
+release_template/
+*.zip
+**/bin/
+**/obj/

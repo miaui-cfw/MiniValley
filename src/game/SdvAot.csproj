@@ -1,0 +1,65 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- MiniValley builds the release only (the test probe lives in MiniValley-devtools) -->
+  <PropertyGroup><SdvRelease Condition="'$(SdvRelease)' == ''">1</SdvRelease></PropertyGroup>
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <AssemblyName>StardewAot</AssemblyName>
+    <Nullable>disable</Nullable>
+    <PublishAot>true</PublishAot>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
+    <TrimMode>partial</TrimMode>
+    <IlcGenerateCompleteTypeMetadata>false</IlcGenerateCompleteTypeMetadata>
+    <SuppressTrimAnalysisWarnings>true</SuppressTrimAnalysisWarnings>
+    <NoWarn>$(NoWarn);IL2026;IL3050;IL2104;IL3053;IL3000;IL3002;CS8002</NoWarn>
+    <StripSymbols>true</StripSymbols>
+    <LinkerFlavor>lld</LinkerFlavor>
+    <ObjCopyName>llvm-objcopy</ObjCopyName>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+  <!-- release (-p:SdvRelease=1): no test probe, no measurement code; speed-optimised native code -->
+  <PropertyGroup Condition="'$(SdvRelease)' == '1'">
+    <DefineConstants>$(DefineConstants);SDV_RELEASE</DefineConstants>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(SdvRelease)' == '1' Or '$(SdvSpeed)' == '1'">
+    <OptimizationPreference>Speed</OptimizationPreference>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(SdvRelease)' == '1'">
+    <Compile Remove="StartupHook.cs;Fixes.cs;Sizes.cs" />
+  </ItemGroup>
+  <ItemGroup>
+    <TrimmerRootDescriptor Include="keep.xml" />
+    <RdXmlFile Include="readers.rd.xml" />
+  </ItemGroup>
+  <ItemGroup>
+    <Reference Include="Stardew Valley"><HintPath>/w/libs/Stardew Valley.dll</HintPath></Reference>
+    <TrimmerRootAssembly Include="Stardew Valley" />
+    <Reference Include="SdvAotPatches"><HintPath>/w/libs/SdvAotPatches.dll</HintPath></Reference>
+    <TrimmerRootAssembly Include="SdvAotPatches" />
+    <Reference Include="SdvXmlSerializers"><HintPath>/w/libs/SdvXmlSerializers.dll</HintPath></Reference>
+    <Reference Include="MonoGame.Framework"><HintPath>/w/libs/MonoGame.Framework.dll</HintPath></Reference>
+    <TrimmerRootAssembly Include="MonoGame.Framework" />
+    <Reference Include="xTile"><HintPath>/w/libs/xTile.dll</HintPath></Reference>
+    <TrimmerRootAssembly Include="xTile" />
+    <Reference Include="StardewValley.GameData"><HintPath>/game/StardewValley.GameData.dll</HintPath></Reference>
+    <TrimmerRootAssembly Include="StardewValley.GameData" />
+    <Reference Include="BmFont"><HintPath>/game/BmFont.dll</HintPath></Reference>
+    <TrimmerRootAssembly Include="BmFont" />
+    <Reference Include="CPExtBmFont"><HintPath>/game/CPExtBmFont.dll</HintPath></Reference>
+    <TrimmerRootAssembly Include="CPExtBmFont" />
+    <Reference Include="Lidgren.Network"><HintPath>/game/Lidgren.Network.dll</HintPath></Reference>
+    <Reference Include="Steamworks.NET"><HintPath>/w/libs/Steamworks.NET.dll</HintPath></Reference>
+    <Reference Include="GalaxyCSharp"><HintPath>/game/GalaxyCSharp.dll</HintPath></Reference>
+    <Reference Include="SkiaSharp"><HintPath>/game/SkiaSharp.dll</HintPath></Reference>
+    <Reference Include="TextCopy"><HintPath>/game/TextCopy.dll</HintPath></Reference>
+    <Reference Include="System.Data.HashFunction.Core"><HintPath>/game/System.Data.HashFunction.Core.dll</HintPath></Reference>
+    <TrimmerRootAssembly Include="System.Data.HashFunction.Core" />
+    <Reference Include="System.Data.HashFunction.Interfaces"><HintPath>/game/System.Data.HashFunction.Interfaces.dll</HintPath></Reference>
+    <TrimmerRootAssembly Include="System.Data.HashFunction.Interfaces" />
+    <Reference Include="System.Data.HashFunction.xxHash"><HintPath>/game/System.Data.HashFunction.xxHash.dll</HintPath></Reference>
+    <TrimmerRootAssembly Include="System.Data.HashFunction.xxHash" />
+    <Reference Include="FAudio-CS"><HintPath>/game/FAudio-CS.dll</HintPath></Reference>
+  </ItemGroup>
+</Project>

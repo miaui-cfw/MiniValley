@@ -1,0 +1,1 @@
+19000000010000000100000000010000,RG35XX Gamepad,a:b0,b:b1,x:b3,y:b2,leftshoulder:b4,rightshoulder:b5,lefttrigger:b6,righttrigger:b7,guide:b10,start:b9,back:b8,dpup:b13,dpleft:b15,dpright:b16,dpdown:b14,platform:Linux,

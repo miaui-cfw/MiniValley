@@ -1,0 +1,14 @@
+{
+  "Strings/UI": {
+    "ExitToDesktop": {
+      "en": "Exit to MiaUI",
+      "de-DE": "Zurück zu MiaUI",
+      "es-ES": "Salir a MiaUI",
+      "fr-FR": "Quitter vers MiaUI",
+      "hu-HU": "Kilépés a MiaUI-ba",
+      "it-IT": "Vai a MiaUI",
+      "pt-BR": "Voltar ao MiaUI",
+      "tr-TR": "MiaUI'a Dön"
+    }
+  }
+}

@@ -1,0 +1,506 @@
+diff --git a/xTile.Display/XnaDisplayDevice.cs b/xTile.Display/XnaDisplayDevice.cs
+index a93055f..baf24ea 100644
+--- a/xTile.Display/XnaDisplayDevice.cs
++++ b/xTile.Display/XnaDisplayDevice.cs
+@@ -57,6 +57,24 @@ public class XnaDisplayDevice : IDisplayDevice
+ 
++	/// <summary>RG35XX port: while this returns true (Stardew: a save is loading, all 87 maps call LoadTileSheets),
++	/// tilesheet textures are only loaded on first draw. Otherwise (warps, map reloads) they load right away, behind
++	/// the warp fade, so gameplay frames never wait for a texture.</summary>
++	public static Func<bool> DeferTileSheetLoads;
++
+ 	public void LoadTileSheet(TileSheet tileSheet)
+ 	{
+-		Texture2D value = m_contentManager.Load<Texture2D>(tileSheet.ImageSource);
+-		m_tileSheetTextures[tileSheet] = value;
++		m_tileSheetTextures.Remove(tileSheet);   // ImageSource may have changed (seasonal sheets)
++		if (DeferTileSheetLoads == null || !DeferTileSheetLoads())
++		{
++			TextureFor(tileSheet);
++		}
++	}
++
++	private Texture2D TextureFor(TileSheet tileSheet)
++	{
++		if (!m_tileSheetTextures.TryGetValue(tileSheet, out Texture2D value))
++		{
++			value = m_contentManager.Load<Texture2D>(tileSheet.ImageSource);
++			m_tileSheetTextures[tileSheet] = value;
++		}
++		return value;
+ 	}
+@@ -91,3 +109,3 @@ public class XnaDisplayDevice : IDisplayDevice
+ 			xTile.Dimensions.Rectangle tileImageBounds = tile.TileSheet.GetTileImageBounds(tile.TileIndex);
+-			Texture2D texture2D = m_tileSheetTextures[tile.TileSheet];
++			Texture2D texture2D = TextureFor(tile.TileSheet);
+ 			if (!texture2D.IsDisposed)
+diff --git a/xTile.Layers/Layer.cs b/xTile.Layers/Layer.cs
+index a0f64eb..d667fbe 100644
+--- a/xTile.Layers/Layer.cs
++++ b/xTile.Layers/Layer.cs
+@@ -22,3 +22,20 @@ public class Layer : DescribedComponent
+ 
+-	private Tile[,] m_tiles;
++	// RG35XX port: compact tile storage. One int per cell instead of a StaticTile object (244k of them in Stardew):
++	// 0 = empty; > 0 = static tile: tile index (bits 0-19), additive blend (bit 20), sheet table index + 1 (bits 21-30);
++	// < 0 = stored object -(k + 1) in m_objects (animated tiles, tiles with properties).
++	private const int IndexMask = 0xFFFFF;
++
++	private const int AdditiveBit = 1 << 20;
++
++	private const int SheetShift = 21;
++
++	private int[] m_cells;
++
++	private readonly List<Tile> m_objects = new List<Tile>();
++
++	private readonly Stack<int> m_freeObjects = new Stack<int>();
++
++	private readonly List<TileSheet> m_sheetTable = new List<TileSheet>();
++
++	private StaticTile m_scratch;
+ 
+@@ -46,14 +63,25 @@ public class Layer : DescribedComponent
+ 			}
+-			Tile[,] array = new Tile[value.Width, value.Height];
++			int[] array = new int[value.Width * value.Height];
+ 			int num = Math.Min(m_layerSize.Width, value.Width);
+ 			int num2 = Math.Min(m_layerSize.Height, value.Height);
+-			for (int i = 0; i < num2; i++)
++			for (int i = 0; i < m_layerSize.Height; i++)
+ 			{
+-				for (int j = 0; j < num; j++)
++				for (int j = 0; j < m_layerSize.Width; j++)
+ 				{
+-					array[j, i] = m_tiles[j, i];
++					int c = m_cells[j + i * m_layerSize.Width];
++					if (j < num && i < num2)
++					{
++						array[j + i * value.Width] = c;
++					}
++					else if (c < 0)
++					{
++						m_objects[-c - 1] = null;
++						m_freeObjects.Push(-c - 1);
++					}
+ 				}
+ 			}
+-			m_tiles = array;
+-			m_tileArray = new TileArray(this, m_tiles);
++			// bound tiles keep pointing at old cell numbers: they simply stop writing back
++			m_cells = array;
++			_skipMap = null;
++			m_tileArray = new TileArray(this);
+ 			m_layerSize = value;
+@@ -154,4 +182,4 @@ public class Layer : DescribedComponent
+ 		m_tileSize = tileSize;
+-		m_tiles = new Tile[layerSize.Width, layerSize.Height];
+-		m_tileArray = new TileArray(this, m_tiles);
++		m_cells = new int[layerSize.Width * layerSize.Height];
++		m_tileArray = new TileArray(this);
+ 		m_visible = true;
+@@ -160,2 +188,154 @@ public class Layer : DescribedComponent
+ 
++	/// <summary>Tile at a cell: the stored object, or a StaticTile bound to the compact cell (writes go back to it).</summary>
++	internal Tile GetTile(int x, int y)
++	{
++		int cell = x + y * m_layerSize.Width;
++		int c = m_cells[cell];
++		if (c == 0)
++		{
++			return null;
++		}
++		if (c < 0)
++		{
++			return m_objects[-c - 1];
++		}
++		StaticTile tile = new StaticTile(this, m_sheetTable[(c >> SheetShift) - 1], ((c & AdditiveBit) != 0) ? BlendMode.Additive : BlendMode.Alpha, c & IndexMask, unchecked_: true);
++		tile.m_boundLayer = this;
++		tile.m_boundCell = cell;
++		return tile;
++	}
++
++	internal void SetTile(int x, int y, Tile tile)
++	{
++		int cell = x + y * m_layerSize.Width;
++		FreeObject(cell);
++		if (tile == null)
++		{
++			m_cells[cell] = 0;
++			return;
++		}
++		if (tile is StaticTile staticTile && !staticTile.HasOwnProperties && TryEncode(staticTile, out int code))
++		{
++			m_cells[cell] = code;
++			if (staticTile.m_boundLayer == null || staticTile.m_boundLayer == this)
++			{
++				// the caller's object now stands for this cell: later TileIndex/property writes still reach the map
++				staticTile.m_boundLayer = this;
++				staticTile.m_boundCell = cell;
++			}
++			return;
++		}
++		if (tile is StaticTile bound && bound.m_boundLayer == this)
++		{
++			bound.m_boundLayer = null;
++			bound.m_boundCell = -1;
++		}
++		StoreObject(cell, tile);
++	}
++
++	/// <summary>A bound tile changed (TileIndex/BlendMode): re-encode its cell if it is still a compact cell.</summary>
++	internal void WriteBack(StaticTile tile)
++	{
++		int cell = tile.m_boundCell;
++		if (cell < 0 || cell >= m_cells.Length || m_cells[cell] <= 0 || !TryEncode(tile, out int code))
++		{
++			tile.m_boundLayer = null;
++			tile.m_boundCell = -1;
++			return;
++		}
++		m_cells[cell] = code;
++		MarkRowDirty(cell / m_layerSize.Width);
++	}
++
++	/// <summary>A bound tile is getting properties: keep the object itself in its cell from now on.</summary>
++	internal void Materialize(StaticTile tile)
++	{
++		int cell = tile.m_boundCell;
++		tile.m_boundLayer = null;
++		tile.m_boundCell = -1;
++		if (cell >= 0 && cell < m_cells.Length && m_cells[cell] > 0)
++		{
++			StoreObject(cell, tile);
++		}
++	}
++
++	private bool TryEncode(StaticTile tile, out int code)
++	{
++		code = 0;
++		int index = tile.TileIndex;
++		if (index < 0 || index > IndexMask || tile.TileSheet == null)
++		{
++			return false;
++		}
++		int sheet = m_sheetTable.IndexOf(tile.TileSheet);
++		if (sheet < 0)
++		{
++			if (m_sheetTable.Count >= 1023)
++			{
++				return false;
++			}
++			m_sheetTable.Add(tile.TileSheet);
++			sheet = m_sheetTable.Count - 1;
++		}
++		code = ((sheet + 1) << SheetShift) | index | ((tile.BlendMode == BlendMode.Additive) ? AdditiveBit : 0);
++		return true;
++	}
++
++	private void StoreObject(int cell, Tile tile)
++	{
++		int k;
++		if (m_freeObjects.Count > 0)
++		{
++			k = m_freeObjects.Pop();
++			m_objects[k] = tile;
++		}
++		else
++		{
++			m_objects.Add(tile);
++			k = m_objects.Count - 1;
++		}
++		m_cells[cell] = -(k + 1);
++	}
++
++	private void FreeObject(int cell)
++	{
++		int c = m_cells[cell];
++		if (c < 0)
++		{
++			m_objects[-c - 1] = null;
++			m_freeObjects.Push(-c - 1);
++		}
++	}
++
++	/// <summary>Draw path: no allocation for compact cells (one reused scratch tile; the display device only reads sheet/index).</summary>
++	private Tile DrawTileAt(int x, int y)
++	{
++		int c = m_cells[x + y * m_layerSize.Width];
++		if (c == 0)
++		{
++			return null;
++		}
++		if (c < 0)
++		{
++			return m_objects[-c - 1];
++		}
++		m_scratch ??= new StaticTile(this, null, BlendMode.Alpha, 0, unchecked_: true);
++		m_scratch.SetScratch(m_sheetTable[(c >> SheetShift) - 1], c & IndexMask, ((c & AdditiveBit) != 0) ? BlendMode.Additive : BlendMode.Alpha);
++		return m_scratch;
++	}
++
++	/// <summary>Old API: a snapshot array (allocates).</summary>
++	internal Tile[,] SnapshotArray()
++	{
++		Tile[,] array = new Tile[m_layerSize.Width, m_layerSize.Height];
++		for (int i = 0; i < m_layerSize.Height; i++)
++		{
++			for (int j = 0; j < m_layerSize.Width; j++)
++			{
++				array[j, i] = GetTile(j, i);
++			}
++		}
++		return array;
++	}
++
+ 	public void MarkRowDirty(int y)
+@@ -171,4 +351,4 @@ public class Layer : DescribedComponent
+ 			{
+-				Tile tile = m_tiles[j, i];
+-				if (tile != null && tile.DependsOnTileSheet(tileSheet))
++				int c = m_cells[j + i * m_layerSize.Width];
++				if (c > 0 ? m_sheetTable[(c >> SheetShift) - 1] == tileSheet : c < 0 && m_objects[-c - 1].DependsOnTileSheet(tileSheet))
+ 				{
+@@ -234,3 +414,3 @@ public class Layer : DescribedComponent
+ 		{
+-			return m_tiles[tileLocation.X, tileLocation.Y];
++			return GetTile(tileLocation.X, tileLocation.Y);
+ 		}
+@@ -245,6 +425,6 @@ public class Layer : DescribedComponent
+ 			{
+-				Tile tile = m_tiles[j, i];
+-				if (tile != null && tile.DependsOnTileSheet(tileSheet))
++				int c = m_cells[j + i * m_layerSize.Width];
++				if (c > 0 ? m_sheetTable[(c >> SheetShift) - 1] == tileSheet : c < 0 && m_objects[-c - 1].DependsOnTileSheet(tileSheet))
+ 				{
+-					m_tiles[j, i] = null;
++					SetTile(j, i, null);
+ 				}
+@@ -287,3 +467,3 @@ public class Layer : DescribedComponent
+ 			_skipMap[num2, y] = num;
+-			if (Tiles[num2, y] != null)
++			if (m_cells[num2 + y * m_layerSize.Width] != 0)
+ 			{
+@@ -353,3 +533,3 @@ public class Layer : DescribedComponent
+ 				num9 = _skipMap[k, j];
+-				Tile tile = m_tiles[k, j];
++				Tile tile = DrawTileAt(k, j);
+ 				if (tile != null)
+@@ -408,3 +588,3 @@ public class Layer : DescribedComponent
+ 			{
+-				Tile tile = m_tiles[Wrap(j, width2), Wrap(i, height2)];
++				Tile tile = DrawTileAt(Wrap(j, width2), Wrap(i, height2));
+ 				if (tile != null)
+diff --git a/xTile.ObjectModel/BoundTileProperties.cs b/xTile.ObjectModel/BoundTileProperties.cs
+new file mode 100644
+index 0000000..d7f4256
+--- /dev/null
++++ b/xTile.ObjectModel/BoundTileProperties.cs
+@@ -0,0 +1,67 @@
++using System;
++using System.Collections;
++using System.Collections.Generic;
++using xTile.Tiles;
++
++namespace xTile.ObjectModel;
++
++/// <summary>RG35XX port: the properties of a compact (cell-stored) tile. Empty for reading, without allocating a
++/// collection per tile; the first write turns the tile into a stored object with a real collection.</summary>
++internal sealed class BoundTileProperties : IPropertyCollection
++{
++	private static readonly PropertyCollection s_empty = new PropertyCollection();
++
++	private readonly StaticTile m_tile;
++
++	internal BoundTileProperties(StaticTile tile)
++	{
++		m_tile = tile;
++	}
++
++	private IPropertyCollection Real => m_tile.MaterializeProperties();
++
++	public PropertyValue this[string key]
++	{
++		get => throw new KeyNotFoundException(key);
++		set => Real[key] = value;
++	}
++
++	public ICollection<string> Keys => s_empty.Keys;
++
++	public ICollection<PropertyValue> Values => s_empty.Values;
++
++	public int Count => 0;
++
++	public bool IsReadOnly => false;
++
++	public void Add(string key, PropertyValue value) => Real.Add(key, value);
++
++	public void Add(KeyValuePair<string, PropertyValue> item) => Real.Add(item);
++
++	public void Clear() { }
++
++	public bool Contains(KeyValuePair<string, PropertyValue> item) => false;
++
++	public bool ContainsKey(string key) => false;
++
++	public void CopyTo(KeyValuePair<string, PropertyValue>[] array, int arrayIndex) { }
++
++	public IEnumerator<KeyValuePair<string, PropertyValue>> GetEnumerator() => ((IEnumerable<KeyValuePair<string, PropertyValue>>)s_empty).GetEnumerator();
++
++	public bool Remove(string key) => false;
++
++	public bool Remove(KeyValuePair<string, PropertyValue> item) => false;
++
++	public bool TryGetValue(string key, out PropertyValue value)
++	{
++		value = null;
++		return false;
++	}
++
++	IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
++
++	public void CopyFrom(IPropertyCollection propertyCollection)
++	{
++		if (propertyCollection != null && propertyCollection.Count > 0) Real.CopyFrom(propertyCollection);
++	}
++}
+diff --git a/xTile.ObjectModel/Component.cs b/xTile.ObjectModel/Component.cs
+index 2db4628..3a64782 100644
+--- a/xTile.ObjectModel/Component.cs
++++ b/xTile.ObjectModel/Component.cs
+@@ -22,3 +22,7 @@ public abstract class Component
+ 
+-	public virtual IPropertyCollection Properties => m_propertyCollection;
++	/// <summary>RG35XX port: created on first access (most map tiles never have properties).</summary>
++	public virtual IPropertyCollection Properties => m_propertyCollection ??= new PropertyCollection();
++
++	/// <summary>RG35XX port: whether this component has a property collection yet.</summary>
++	internal bool HasOwnProperties => m_propertyCollection != null && m_propertyCollection.Count > 0;
+ 
+@@ -27,3 +31,2 @@ public abstract class Component
+ 		m_id = Guid.NewGuid().ToString();
+-		m_propertyCollection = new PropertyCollection();
+ 	}
+@@ -33,3 +36,2 @@ public abstract class Component
+ 		m_id = id;
+-		m_propertyCollection = new PropertyCollection();
+ 	}
+diff --git a/xTile.Tiles/StaticTile.cs b/xTile.Tiles/StaticTile.cs
+index fa73acf..16150ed 100644
+--- a/xTile.Tiles/StaticTile.cs
++++ b/xTile.Tiles/StaticTile.cs
+@@ -13,2 +13,7 @@ public class StaticTile : Tile
+ 
++	/// <summary>RG35XX port: when set, this tile stands for a compact cell of that layer: writes go back to the cell.</summary>
++	internal Layer m_boundLayer;
++
++	internal int m_boundCell = -1;
++
+ 	public override BlendMode BlendMode
+@@ -22,2 +27,6 @@ public class StaticTile : Tile
+ 			m_blendMode = value;
++			if (m_boundLayer != null)
++			{
++				m_boundLayer.WriteBack(this);
++			}
+ 		}
+@@ -36,2 +45,6 @@ public class StaticTile : Tile
+ 			m_tileIndex = value;
++			if (m_boundLayer != null)
++			{
++				m_boundLayer.WriteBack(this);
++			}
+ 		}
+@@ -39,2 +52,31 @@ public class StaticTile : Tile
+ 
++	/// <summary>RG35XX port: compact tiles report empty properties without allocating; a write materialises them.</summary>
++	public override xTile.ObjectModel.IPropertyCollection Properties => m_boundLayer != null && !HasOwnProperties ? new xTile.ObjectModel.BoundTileProperties(this) : base.Properties;
++
++	/// <summary>Make this tile the stored object of its cell (it is about to get properties) and return its real collection.</summary>
++	internal xTile.ObjectModel.IPropertyCollection MaterializeProperties()
++	{
++		if (m_boundLayer != null)
++		{
++			m_boundLayer.Materialize(this);
++		}
++		return base.Properties;
++	}
++
++	/// <summary>Internal constructor for compact cells and the draw scratch tile (no validation).</summary>
++	internal StaticTile(Layer layer, TileSheet tileSheet, BlendMode blendMode, int tileIndex, bool unchecked_)
++		: base(layer)
++	{
++		m_blendMode = blendMode;
++		m_tileSheet = tileSheet;
++		m_tileIndex = tileIndex;
++	}
++
++	internal void SetScratch(TileSheet tileSheet, int tileIndex, BlendMode blendMode)
++	{
++		m_tileSheet = tileSheet;
++		m_tileIndex = tileIndex;
++		m_blendMode = blendMode;
++	}
++
+ 	public StaticTile(Layer layer, TileSheet tileSheet, BlendMode blendMode, int tileIndex)
+diff --git a/xTile.Tiles/TileArray.cs b/xTile.Tiles/TileArray.cs
+index 9c313a1..6244213 100644
+--- a/xTile.Tiles/TileArray.cs
++++ b/xTile.Tiles/TileArray.cs
+@@ -1,3 +1 @@
+-using System;
+-using System.Collections.ObjectModel;
+ using xTile.Dimensions;
+@@ -7,2 +5,3 @@ namespace xTile.Tiles;
+ 
++/// <summary>RG35XX port: a view over the layer's compact cell storage (see Layer).</summary>
+ public class TileArray
+@@ -11,7 +10,4 @@ public class TileArray
+ 
+-	private ReadOnlyCollection<TileSheet> m_tileSheets;
+-
+-	private Tile[,] m_tiles;
+-
+-	public Tile[,] Array => m_tiles;
++	/// <summary>Snapshot of the grid (allocates; the game never uses it).</summary>
++	public Tile[,] Array => m_layer.SnapshotArray();
+ 
+@@ -25,3 +21,3 @@ public class TileArray
+ 			}
+-			return m_tiles[x, y];
++			return m_layer.GetTile(x, y);
+ 		}
+@@ -29,17 +25,7 @@ public class TileArray
+ 		{
+-			if (value == null)
+-			{
+-				m_tiles[x, y] = null;
+-				return;
+-			}
+-			if (!m_tileSheets.Contains(value.TileSheet))
+-			{
+-				throw new Exception("The tile contains an invalid TileSheet reference");
+-			}
+-			if (value.TileIndex >= 0)
++			if (value != null && !m_layer.Map.TileSheets.Contains(value.TileSheet))
+ 			{
+-				_ = value.TileIndex;
+-				_ = value.TileSheet.TileCount;
++				throw new System.Exception("The tile contains an invalid TileSheet reference");
+ 			}
+-			m_tiles[x, y] = value;
++			m_layer.SetTile(x, y, value);
+ 			m_layer.MarkRowDirty(y);
+@@ -57,3 +43,2 @@ public class TileArray
+ 			this[location.X, location.Y] = value;
+-			m_layer.MarkRowDirty(location.Y);
+ 		}
+@@ -61,7 +46,5 @@ public class TileArray
+ 
+-	public TileArray(Layer layer, Tile[,] tiles)
++	public TileArray(Layer layer)
+ 	{
+ 		m_layer = layer;
+-		m_tileSheets = m_layer.Map.TileSheets;
+-		m_tiles = tiles;
+ 	}

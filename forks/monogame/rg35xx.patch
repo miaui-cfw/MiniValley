@@ -1,0 +1,1364 @@
+diff --git a/Microsoft.Xna.Framework.Audio/WaveBank.cs b/Microsoft.Xna.Framework.Audio/WaveBank.cs
+index 4dbbd0d..d2b6f81 100644
+--- a/Microsoft.Xna.Framework.Audio/WaveBank.cs
++++ b/Microsoft.Xna.Framework.Audio/WaveBank.cs
+@@ -57,2 +57,17 @@ public class WaveBank : IDisposable
+ 
++	/// <summary>RG35XX port: the "in-memory" constructor loads entries on first use instead (Stardew's PC bank is
++	/// 460 MB), keeping at most MG_WAVE_CACHE_MB (default 8) of wave data and releasing the least recently used
++	/// entries that are not playing. MG_WAVE_LAZY=0 restores the original behaviour.</summary>
++	private readonly bool _lazy;
++
++	private static readonly long s_cacheBudget = (long.TryParse(Environment.GetEnvironmentVariable("MG_WAVE_CACHE_MB"), out long mb) && mb > 0 ? mb : 8) << 20;
++
++	private static long s_cachedBytes;
++
++	private static long s_useClock;
++
++	private long[] _lastUse;
++
++	private System.Collections.Generic.List<SoundEffectInstance>[] _handedOut;
++
+ 	private readonly StreamInfo[] _streams;
+@@ -265,3 +280,13 @@ public class WaveBank : IDisposable
+ 		}
+-		if (!_streaming)
++		_lazy = !_streaming && Environment.GetEnvironmentVariable("MG_WAVE_LAZY") != "0";
++		if (_lazy)
++		{
++			// same failure as the eager path when there is no audio device (it created SoundEffects here):
++			// Stardew catches NoAudioHardwareException from the WaveBank constructor and falls back to silent audio
++			SoundEffect.Device();
++			_lastUse = new long[_streams.Length];
++			_handedOut = new System.Collections.Generic.List<SoundEffectInstance>[_streams.Length];
++			binaryReader.Dispose();
++		}
++		else if (!_streaming)
+ 		{
+@@ -315,2 +340,6 @@ public class WaveBank : IDisposable
+ 	{
++		if (_lazy)
++		{
++			return LoadEntry(trackIndex);
++		}
+ 		return _sounds[trackIndex];
+@@ -327,2 +356,13 @@ public class WaveBank : IDisposable
+ 		streaming = false;
++		if (_lazy)
++		{
++			SoundEffectInstance instance = LoadEntry(trackIndex).GetPooledInstance(forXAct: true);
++			if (instance != null)
++			{
++				var list = _handedOut[trackIndex] ??= new System.Collections.Generic.List<SoundEffectInstance>();
++				list.RemoveAll(x => x.IsDisposed || x._effect != _sounds[trackIndex]);
++				list.Add(instance);
++			}
++			return instance;
++		}
+ 		return _sounds[trackIndex].GetPooledInstance(forXAct: true);
+@@ -356,3 +396,3 @@ public class WaveBank : IDisposable
+ 			{
+-				sounds[i].Dispose();
++				sounds[i]?.Dispose();
+ 			}
+@@ -364,2 +404,68 @@ public class WaveBank : IDisposable
+ 
++	private SoundEffect LoadEntry(int i)
++	{
++		lock (_sounds)
++		{
++			_lastUse[i] = ++s_useClock;
++			if (_sounds[i] != null && !_sounds[i].IsDisposed)
++			{
++				return _sounds[i];
++			}
++			if (_sounds[i] != null)
++			{
++				s_cachedBytes -= _streams[i].FileLength;   // disposed elsewhere (dependency released): reload
++				_sounds[i] = null;
++			}
++			StreamInfo info = _streams[i];
++			byte[] buffer;
++			using (Stream stream = AudioEngine.OpenStream(_waveBankFileName))
++			{
++				stream.Seek(info.FileOffset + _playRegionOffset, SeekOrigin.Begin);
++				buffer = new byte[info.FileLength];
++				int read = 0;
++				while (read < buffer.Length)
++				{
++					int n = stream.Read(buffer, read, buffer.Length - read);
++					if (n <= 0) break;
++					read += n;
++				}
++			}
++			DecodeFormat(info.Format, out var codec, out var channels, out var rate, out var alignment);
++			_sounds[i] = new SoundEffect(codec, buffer, channels, rate, alignment, info.LoopStart, info.LoopLength);
++			s_cachedBytes += info.FileLength;
++			Evict(i);
++			return _sounds[i];
++		}
++	}
++
++	/// <summary>Release least recently used entries that are not playing until the cache fits the budget.</summary>
++	private void Evict(int keep)
++	{
++		while (s_cachedBytes > s_cacheBudget)
++		{
++			int victim = -1;
++			for (int j = 0; j < _sounds.Length; j++)
++			{
++				if (j == keep || _sounds[j] == null || IsPlaying(j)) continue;
++				if (victim < 0 || _lastUse[j] < _lastUse[victim]) victim = j;
++			}
++			if (victim < 0) return;   // everything else is playing: go over budget for now
++			s_cachedBytes -= _streams[victim].FileLength;
++			_sounds[victim].Dispose();
++			_sounds[victim] = null;
++			_handedOut[victim]?.Clear();
++		}
++	}
++
++	private bool IsPlaying(int j)
++	{
++		var list = _handedOut[j];
++		if (list == null) return false;
++		foreach (var instance in list)
++		{
++			if (!instance.IsDisposed && instance._effect == _sounds[j] && instance.State != SoundState.Stopped) return true;
++		}
++		return false;
++	}
++
+ 	private SoundEffectInstance PlatformCreateStream(StreamInfo stream)
+diff --git a/Microsoft.Xna.Framework.Content/ContentManager.cs b/Microsoft.Xna.Framework.Content/ContentManager.cs
+index 9f9c6a1..c249966 100644
+--- a/Microsoft.Xna.Framework.Content/ContentManager.cs
++++ b/Microsoft.Xna.Framework.Content/ContentManager.cs
+@@ -216,2 +216,7 @@ public class ContentManager : IDisposable
+ 
++#if RG_PROFILE
++	/// <summary>RG35XX port (profiling builds): MG_ASSET_LOG=path appends every asset opened (to build minimal content sets for tests).</summary>
++	private static readonly string s_assetLog = Environment.GetEnvironmentVariable("MG_ASSET_LOG");
++#endif
++
+ 	protected virtual Stream OpenStream(string assetName)
+@@ -221,2 +226,8 @@ public class ContentManager : IDisposable
+ 			string text = Path.Combine(RootDirectory, assetName) + ".xnb";
++#if RG_PROFILE
++			if (s_assetLog != null)
++			{
++				lock (typeof(ContentManager)) File.AppendAllText(s_assetLog, text + "\n");
++			}
++#endif
+ 			if (Path.IsPathRooted(text))
+@@ -241,2 +252,8 @@ public class ContentManager : IDisposable
+ 
++	/// <summary>RG35XX port: re-read a texture from its .xnb (texture paging).</summary>
++	internal Texture2D ReadTextureForPaging(string assetName)
++	{
++		return ReadAsset<Texture2D>(assetName, null);
++	}
++
+ 	protected T ReadAsset<T>(string assetName, Action<IDisposable> recordDisposableObject)
+@@ -253,2 +270,6 @@ public class ContentManager : IDisposable
+ 		Stream stream = OpenStream(assetName);
++		string outerAsset = Texture2D.t_loadingAsset;
++		Texture2D.t_loadingAsset = assetName;   // RG35XX port: Tex16.Keep32 decides by asset name
++		try
++		{
+ 		using (BinaryReader xnbReader = new BinaryReader(stream))
+@@ -261,2 +282,13 @@ public class ContentManager : IDisposable
+ 			}
++			if (obj is Texture2D pageable && !(obj is RenderTarget2D) && Texture2D.PagingEnabled && Texture2D.IsPageableAsset(assetName))
++			{
++				pageable._pageRoot = RootDirectory;
++				pageable._pageServices = serviceProvider;
++				pageable._pageable = true;
++			}
++		}
++		}
++		finally
++		{
++			Texture2D.t_loadingAsset = outerAsset;
+ 		}
+diff --git a/Microsoft.Xna.Framework.Graphics/GraphicsCapabilities.cs b/Microsoft.Xna.Framework.Graphics/GraphicsCapabilities.cs
+index bd93095..34bc24b 100644
+--- a/Microsoft.Xna.Framework.Graphics/GraphicsCapabilities.cs
++++ b/Microsoft.Xna.Framework.Graphics/GraphicsCapabilities.cs
+@@ -170,2 +170,21 @@ internal class GraphicsCapabilities
+ 		SupportsSeparateBlendStates = device.glMajorVersion >= 4 || GL.Extensions.Contains("GL_ARB_draw_buffers_blend");
++		if (GL.IsES)
++		{
++			// same checks as MonoGame's GLES builds (stock 3.8 #if GLES)
++			SupportsNonPowerOfTwo = GL.Extensions.Contains("GL_OES_texture_npot") || GL.Extensions.Contains("GL_ARB_texture_non_power_of_two") || GL.Extensions.Contains("GL_IMG_texture_npot") || GL.Extensions.Contains("GL_NV_texture_npot_2D_mipmap");
++			SupportsDepth24 = GL.Extensions.Contains("GL_OES_depth24");
++			SupportsPackedDepthStencil = GL.Extensions.Contains("GL_OES_packed_depth_stencil");
++			SupportsDepthNonLinear = GL.Extensions.Contains("GL_NV_depth_nonlinear");
++			SupportsTextureMaxLevel = GL.Extensions.Contains("GL_APPLE_texture_max_level");
++			SupportsFramebufferObjectARB = true;   // core in ES 2.0
++			SupportsSRgb = GL.Extensions.Contains("GL_EXT_sRGB");
++			SupportsFloatTextures = device.glMajorVersion >= 3 || GL.Extensions.Contains("GL_EXT_color_buffer_float");
++			SupportsHalfFloatTextures = device.glMajorVersion >= 3 || GL.Extensions.Contains("GL_EXT_color_buffer_half_float");
++			SupportsNormalized = false;
++			SupportsDepthClamp = false;
++			SupportsInstancing = false;
++			SupportsBaseIndexInstancing = false;
++			SupportsSeparateBlendStates = false;
++			_maxMultiSampleCount = 0;
++		}
+ 	}
+diff --git a/Microsoft.Xna.Framework.Graphics/GraphicsDevice.cs b/Microsoft.Xna.Framework.Graphics/GraphicsDevice.cs
+index d0c8364..0d7f638 100644
+--- a/Microsoft.Xna.Framework.Graphics/GraphicsDevice.cs
++++ b/Microsoft.Xna.Framework.Graphics/GraphicsDevice.cs
+@@ -249,3 +249,3 @@ public class GraphicsDevice : IDisposable
+ 			case ResourceType.Query:
+-				GL.DeleteQueries(1, ref handle);
++				if (GL.DeleteQueries != null) GL.DeleteQueries(1, ref handle);
+ 				break;
+@@ -1104,2 +1104,13 @@ public class GraphicsDevice : IDisposable
+ 		}
++		Texture.s_frame++;
++		if (Texture2D.PagingEnabled && (Texture.s_frame & 127) == 0)
++		{
++			Texture2D.PageOutIdle();
++		}
++#if RG_PROFILE
++		if (s_fpsLog)
++		{
++			FpsTick();
++		}
++#endif
+ 		_graphicsMetrics = default;
+@@ -1108,2 +1119,61 @@ public class GraphicsDevice : IDisposable
+ 
++#if RG_PROFILE
++	/// <summary>RG35XX port (profiling builds only, -p:RgProfile=1): MG_FPS_LOG=1 prints frames per second, draw calls and sprites per frame every 5 s.</summary>
++	private static readonly bool s_fpsLog = Environment.GetEnvironmentVariable("MG_FPS_LOG") == "1";
++
++	private static readonly System.Diagnostics.Stopwatch s_fpsClock = System.Diagnostics.Stopwatch.StartNew();
++
++	private static int s_fpsFrames;
++
++	private static readonly bool s_texReport = Environment.GetEnvironmentVariable("MG_TEX_REPORT") == "1";
++
++	private static int s_texReports;
++
++	private static long s_fpsDraws;
++
++	private static long s_fpsSprites;
++
++	private static double s_lastPresent, s_worstFrame;
++
++	private static int s_slowFrames;
++
++	private void FpsTick()
++	{
++		double now = s_fpsClock.Elapsed.TotalMilliseconds;
++		double frame = now - s_lastPresent;
++		s_lastPresent = now;
++		if (s_fpsFrames > 0)
++		{
++			if (frame > s_worstFrame) s_worstFrame = frame;
++			if (frame > 50.0) s_slowFrames++;
++		}
++		s_fpsFrames++;
++		s_fpsDraws += _graphicsMetrics._drawCount;
++		s_fpsSprites += _graphicsMetrics._spriteCount;
++		double t = s_fpsClock.Elapsed.TotalSeconds;
++		if (t >= 5.0)
++		{
++			Console.Error.WriteLine($"[mg] tex16 565/5551/4444 {Tex16.Count565}/{Tex16.Count5551}/{Tex16.Count4444}, saved {Tex16.BytesSaved / 1048576} MB");
++			double perFrame = 1000.0 / System.Diagnostics.Stopwatch.Frequency / Math.Max(1, s_fpsFrames);
++			Console.Error.WriteLine($"[mg] worst frame {s_worstFrame:F0} ms, {s_slowFrames} frames over 50 ms; per frame: update {s_updateTicks * perFrame:F1} ms ({s_updates} updates), draw {s_drawTicks * perFrame:F1} ms (SpriteBatch.End {s_flushTicks * perFrame:F1} ms, {s_batches / Math.Max(1, s_fpsFrames)} batches; state {s_stateTicks * perFrame:F1}, attribs {s_attribTicks * perFrame:F1}, glDrawElements {s_glDrawTicks * perFrame:F1} ms), gpu {s_gpuTicks * perFrame:F1} ms, swap {s_swapTicks * perFrame:F1} ms");
++			s_updateTicks = s_drawTicks = s_swapTicks = s_gpuTicks = s_flushTicks = 0;
++			s_batches = 0;
++			s_stateTicks = s_attribTicks = s_glDrawTicks = 0;
++			s_updates = 0;
++			s_worstFrame = 0;
++			s_slowFrames = 0;
++			s_lastPresent = 0;
++			Console.Error.WriteLine($"[mg] {s_fpsFrames / t:F1} fps, {s_fpsDraws / Math.Max(1, s_fpsFrames)} draws/frame, {s_fpsSprites / Math.Max(1, s_fpsFrames)} sprites/frame, gc0/1/2 {GC.CollectionCount(0)}/{GC.CollectionCount(1)}/{GC.CollectionCount(2)}, heap {GC.GetTotalMemory(false) / 1048576} MB");
++			if (s_texReport && ++s_texReports % 6 == 0)
++			{
++				Console.Error.Write(Texture2D.MemoryReport(600, 25));
++			}
++			s_fpsFrames = 0;
++			s_fpsDraws = 0;
++			s_fpsSprites = 0;
++			s_fpsClock.Restart();
++		}
++	}
++#endif
++
+ 	public void Reset()
+@@ -1848,4 +1918,22 @@ public class GraphicsDevice : IDisposable
+ 			}
+-			glMajorVersion = Convert.ToInt32(text.Substring(0, 1));
+-			glMinorVersion = Convert.ToInt32(text.Substring(2, 1));
++			if (GL.IsES)
++			{
++				// "OpenGL ES 2.0 build 1.14@3625561"
++				string[] parts = text.Split(' ');
++				if (parts.Length > 2 && parts[0] == "OpenGL" && parts[1] == "ES")
++				{
++					glMajorVersion = Convert.ToInt32(parts[2].Substring(0, 1));
++					glMinorVersion = Convert.ToInt32(parts[2].Substring(2, 1));
++				}
++				else
++				{
++					glMajorVersion = 2;
++					glMinorVersion = 0;
++				}
++			}
++			else
++			{
++				glMajorVersion = Convert.ToInt32(text.Substring(0, 1));
++				glMinorVersion = Convert.ToInt32(text.Substring(2, 1));
++			}
+ 		}
+@@ -1856,3 +1944,7 @@ public class GraphicsDevice : IDisposable
+ 		}
+-		GL.GetInteger(GetPName.MaxDrawBuffers, out var value);
++		int value = 1;   // ES 2.0: one colour attachment, no glDrawBuffers
++		if (!GL.IsES)
++		{
++			GL.GetInteger(GetPName.MaxDrawBuffers, out value);
++		}
+ 		_drawBuffers = new DrawBuffersEnum[value];
+@@ -2018,5 +2110,31 @@ public class GraphicsDevice : IDisposable
+ 
++#if RG_PROFILE
++	/// <summary>RG35XX port: frame phase timing for MG_FPS_LOG (update, draw submission, buffer swap).</summary>
++	internal static long s_updateTicks, s_drawTicks, s_swapTicks, s_gpuTicks, s_flushTicks;
++
++	internal static int s_batches;
++
++	internal static long s_stateTicks, s_attribTicks, s_glDrawTicks;
++
++	private static readonly bool s_gpuSync = Environment.GetEnvironmentVariable("MG_GPU_SYNC") == "1";
++
++	internal static int s_updates;
++#endif
++
+ 	private void PlatformPresent()
+ 	{
++#if RG_PROFILE
++		long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
++		if (s_gpuSync)
++		{
++			GL.Finish();   // MG_GPU_SYNC=1 (tests): wait for the GPU here so "gpu" is the real GPU tail
++			long t1 = System.Diagnostics.Stopwatch.GetTimestamp();
++			s_gpuTicks += t1 - t0;
++			t0 = t1;
++		}
++#endif
+ 		Context.SwapBuffers();
++#if RG_PROFILE
++		s_swapTicks += System.Diagnostics.Stopwatch.GetTimestamp() - t0;
++#endif
+ 		int count = _disposeThisFrame.Count;
+@@ -2257,3 +2375,6 @@ public class GraphicsDevice : IDisposable
+ 		}
+-		GL.DrawBuffers(_currentRenderTargetCount, _drawBuffers);
++		if (!GL.IsES)
++		{
++			GL.DrawBuffers(_currentRenderTargetCount, _drawBuffers);
++		}
+ 		_rasterizerStateDirty = true;
+@@ -2280,3 +2401,14 @@ public class GraphicsDevice : IDisposable
+ 	{
+-		ShaderProgram program = _programCache.GetProgram(VertexShader, PixelShader);
++		ApplyHwDither();
++		Shader pixelShader = PixelShader;
++		int ditherKind = 0;
++		if (pixelShader.DitherPlain != null)
++		{
++			ditherKind = DitherKindForTarget();
++			if (ditherKind == 0)
++			{
++				pixelShader = pixelShader.DitherPlain;
++			}
++		}
++		ShaderProgram program = _programCache.GetProgram(VertexShader, pixelShader);
+ 		if (program.Program == -1)
+@@ -2315,2 +2447,143 @@ public class GraphicsDevice : IDisposable
+ 		}
++		if (ditherKind != 0)
++		{
++			ApplyDither(program, ditherKind);
++		}
++	}
++
++	private static readonly float[] _ditherValues = new float[12];
++
++	/// <summary>RG35XX port: the 2x2 Bayer texture for Shader.Dither, kept bound on texture unit 1.</summary>
++	private int _ditherTexture = -1;
++
++	/// <summary>Set by TextureCollection when something else is bound on unit 1.</summary>
++	internal static bool DitherTextureLost = true;
++
++	/// <summary>RG35XX port: the SGX's own dither (GL_DITHER) of 16-bit colour writes. Free, and its residue after the
++	/// half-size composite is invisible on the RGB565 world target, so it is on there. On the RGBA4444 UI target it
++	/// leaves a visible checker grain and fights the shader dither (measured on the letters), and the backbuffer is
++	/// 32-bit: off everywhere else. MG_HWDITHER=0 turns it off.</summary>
++	internal static bool HwDitherOn;
++
++	private static readonly bool s_hwDither = Environment.GetEnvironmentVariable("MG_HWDITHER") != "0";
++
++	private void ApplyHwDither()
++	{
++		bool want = s_hwDither && IsRenderTargetBound && _currentRenderTargetBindings[0].RenderTarget is RenderTarget2D rt && rt.Format == SurfaceFormat.Bgr565;
++		if (want != HwDitherOn)
++		{
++			if (want)
++			{
++				GL.Enable(EnableCap.Dither);
++			}
++			else
++			{
++				GL.Disable(EnableCap.Dither);
++			}
++			HwDitherOn = want;
++		}
++	}
++
++	/// <summary>Dither for the bound target: 1 RGBA4444, 2 RGB565 (MG_DITHER=all), 3 debug pattern, 0 none.</summary>
++	private int DitherKindForTarget()
++	{
++		SurfaceFormat target = IsRenderTargetBound && _currentRenderTargetBindings[0].RenderTarget is RenderTarget2D rt ? rt.Format : SurfaceFormat.Color;
++		if (target == SurfaceFormat.Bgra4444)
++		{
++			return 1;
++		}
++		if (target == SurfaceFormat.Bgr565)
++		{
++			return Shader.Dither.Mode == "all" ? 2 : 0;
++		}
++		return Shader.Dither.Mode == "show" ? 3 : 0;
++	}
++
++	private unsafe void ApplyDither(ShaderProgram program, int kind)
++	{
++		int scaleLocation = program.GetUniformLocation("rg_dither");
++		if (scaleLocation == -1)
++		{
++			return;
++		}
++		if (DitherTextureLost)
++		{
++			if (_ditherTexture == -1)
++			{
++				// Bayer [[0,2],[3,1]] as (t * 64 + 32) / 255, i.e. (t + 0.5) / 4
++				byte* bayer = stackalloc byte[4] { 32, 160, 224, 96 };
++				GL.GenTextures(1, out _ditherTexture);
++				GL.ActiveTexture((TextureUnit)(33984 + 1));
++				GL.BindTexture(TextureTarget.Texture2D, _ditherTexture);
++				GL.PixelStore(PixelStoreParameter.UnpackAlignment, 1);
++				GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.Luminance, 2, 2, 0, PixelFormat.Luminance, PixelType.UnsignedByte, (IntPtr)bayer);
++				GL.PixelStore(PixelStoreParameter.UnpackAlignment, 4);
++				GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMinFilter, 9728);   // GL_NEAREST
++				GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMagFilter, 9728);
++				GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapS, 10497);      // GL_REPEAT (power of two)
++				GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapT, 10497);
++			}
++			else
++			{
++				GL.ActiveTexture((TextureUnit)(33984 + 1));
++				GL.BindTexture(TextureTarget.Texture2D, _ditherTexture);
++			}
++			GL.ActiveTexture(TextureUnit.Texture0);
++			DitherTextureLost = false;
++		}
++		if (program.DitherKind == -1)
++		{
++			GL.Uniform1(program.GetUniformLocation("rg_dtex"), 1);
++		}
++		int vw = Viewport.Width, vh = Viewport.Height;
++		if (program.DitherViewport != (vw << 16 | vh))
++		{
++			program.DitherViewport = vw << 16 | vh;
++#if RG_PROFILE
++			Console.Error.WriteLine($"[mg] dither program {program.Program}: viewport {vw}x{vh}, target {(_currentRenderTargetBindings[0].RenderTarget is RenderTarget2D drt && IsRenderTargetBound ? drt.Name + " " + drt.Width + "x" + drt.Height : "backbuffer")}");
++#endif
++			_ditherValues[0] = vw * 0.5f;
++			_ditherValues[1] = vh * 0.5f;
++			_ditherValues[2] = _ditherValues[3] = 0f;
++			fixed (float* vp = _ditherValues)
++			{
++				GL.Uniform4(program.GetUniformLocation("rg_vp"), 1, vp);
++			}
++		}
++		// SGX writes 16-bit colour by truncating the 8-bit value (level = v8 >> (8 - bits), measured on the device), and
++		// reads level k back as k / (2^bits - 1). out = in * scale + d * dither + bias puts each of the four Bayer values
++		// (t = 0..3, d = (t + 0.5) / 4 from the texture) in the middle of a truncation bin: the four stored levels average
++		// to in * (2^bits - 1) in quarter steps, and exact levels come back unchanged.
++		//   v8 = bin * (in * N + (t + 0.5) / 4) - 0.5, bin = 2^(8-bits), N = 2^bits - 1  ->  scale = bin * N / 255, dither = bin / 256, bias = -0.5 / 255
++		if (program.DitherKind != kind)
++		{
++			program.DitherKind = kind;
++			for (int i = 0; i < 4; i++)
++			{
++				int bits = kind == 1 ? 4 : kind == 2 ? (i == 1 ? 6 : i == 3 ? 0 : 5) : 0;
++				float scale = 1f, dither = 0f, bias = 0f;
++				if (bits > 0)
++				{
++					float bin = 1 << (8 - bits);              // 8-bit values per level
++					scale = bin * ((1 << bits) - 1) / 255f;
++					dither = bin / 256f;                       // d = (t * 64 + 32) / 255 = (t + 0.5) * 255/256 / 4 -> bin * (t + 0.5) / 4 in 8-bit units
++					bias = -0.5f / 255f;
++				}
++				if (kind == 3)
++				{
++					scale = 1f;
++					dither = 0.25f;
++					bias = -0.125f;
++				}
++				_ditherValues[i] = scale;
++				_ditherValues[4 + i] = dither;
++				_ditherValues[8 + i] = bias;
++			}
++			fixed (float* d = _ditherValues)
++			{
++				GL.Uniform4(program.GetUniformLocation("rg_scale"), 1, d);
++				GL.Uniform4(scaleLocation, 1, d + 4);
++				GL.Uniform4(program.GetUniformLocation("rg_dbias"), 1, d + 8);
++			}
++		}
+ 	}
+@@ -2427,3 +2700,10 @@ public class GraphicsDevice : IDisposable
+ 	{
++#if RG_PROFILE
++		long ts0 = System.Diagnostics.Stopwatch.GetTimestamp();
++#endif
+ 		ApplyState(applyShaders: true);
++#if RG_PROFILE
++		long ts1 = System.Diagnostics.Stopwatch.GetTimestamp();
++		s_stateTicks += ts1 - ts0;
++#endif
+ 		GL.BindBuffer(BufferTarget.ArrayBuffer, 0);
+@@ -2436,3 +2716,10 @@ public class GraphicsDevice : IDisposable
+ 		vertexDeclaration.Apply(_vertexShader, offset, ShaderProgramHash);
++#if RG_PROFILE
++		long ts2 = System.Diagnostics.Stopwatch.GetTimestamp();
++		s_attribTicks += ts2 - ts1;
++#endif
+ 		GL.DrawElements(PrimitiveTypeGL(primitiveType), GetElementCountArray(primitiveType, primitiveCount), DrawElementsType.UnsignedShort, (IntPtr)(gCHandle2.AddrOfPinnedObject().ToInt64() + indexOffset * 2));
++#if RG_PROFILE
++		s_glDrawTicks += System.Diagnostics.Stopwatch.GetTimestamp() - ts2;
++#endif
+ 		gCHandle2.Free();
+diff --git a/Microsoft.Xna.Framework.Graphics/GraphicsExtensions.cs b/Microsoft.Xna.Framework.Graphics/GraphicsExtensions.cs
+index 63a4e96..a881345 100644
+--- a/Microsoft.Xna.Framework.Graphics/GraphicsExtensions.cs
++++ b/Microsoft.Xna.Framework.Graphics/GraphicsExtensions.cs
+@@ -292,3 +292,3 @@ internal static class GraphicsExtensions
+ 		case SurfaceFormat.Bgra4444:
+-			glInternalFormat = PixelInternalFormat.Rgba4;
++			glInternalFormat = GL.IsES ? PixelInternalFormat.Rgba : PixelInternalFormat.Rgba4;   // ES 2.0: internal format must equal format
+ 			glFormat = PixelFormat.Rgba;
+diff --git a/Microsoft.Xna.Framework.Graphics/IndexBuffer.cs b/Microsoft.Xna.Framework.Graphics/IndexBuffer.cs
+index 31e4f35..c9b347c 100644
+--- a/Microsoft.Xna.Framework.Graphics/IndexBuffer.cs
++++ b/Microsoft.Xna.Framework.Graphics/IndexBuffer.cs
+@@ -174,3 +174,3 @@ public class IndexBuffer : GraphicsResource
+ 		GL.BindBuffer(BufferTarget.ElementArrayBuffer, ibo);
+-		int num = Marshal.SizeOf(typeof(T));
++		int num = System.Runtime.CompilerServices.Unsafe.SizeOf<T>();
+ 		IntPtr source = new IntPtr(GL.MapBuffer(BufferTarget.ElementArrayBuffer, BufferAccess.ReadOnly).ToInt64() + offsetInBytes);
+@@ -206,3 +206,3 @@ public class IndexBuffer : GraphicsResource
+ 		GenerateIfRequired();
+-		int num = Marshal.SizeOf(typeof(T));
++		int num = System.Runtime.CompilerServices.Unsafe.SizeOf<T>();
+ 		int num2 = num * elementCount;
+diff --git a/Microsoft.Xna.Framework.Graphics/RasterizerState.cs b/Microsoft.Xna.Framework.Graphics/RasterizerState.cs
+index fb76d4d..c70aeb1 100644
+--- a/Microsoft.Xna.Framework.Graphics/RasterizerState.cs
++++ b/Microsoft.Xna.Framework.Graphics/RasterizerState.cs
+@@ -200,2 +200,3 @@ public class RasterizerState : GraphicsResource
+ 			GL.Disable(EnableCap.Dither);
++			GraphicsDevice.HwDitherOn = false;   // RG35XX port: GraphicsDevice.ApplyHwDither turns it on per target
+ 		}
+@@ -229,3 +230,7 @@ public class RasterizerState : GraphicsResource
+ 		}
+-		if (FillMode == FillMode.Solid)
++		if (GL.IsES)
++		{
++			// ES 2.0 has no glPolygonMode: always solid
++		}
++		else if (FillMode == FillMode.Solid)
+ 		{
+diff --git a/Microsoft.Xna.Framework.Graphics/SamplerState.cs b/Microsoft.Xna.Framework.Graphics/SamplerState.cs
+index a66b988..bcb6cc1 100644
+--- a/Microsoft.Xna.Framework.Graphics/SamplerState.cs
++++ b/Microsoft.Xna.Framework.Graphics/SamplerState.cs
+@@ -351,2 +351,4 @@ public class SamplerState : GraphicsResource
+ 		GL.TexParameter(target, TextureParameterName.TextureWrapT, GetWrapMode(AddressV));
++		if (!GL.IsES)   // ES 2.0: no border colour, LOD bias or comparison samplers
++		{
+ 		_openGLBorderColor[0] = (float)(int)BorderColor.R / 255f;
+@@ -369,2 +371,3 @@ public class SamplerState : GraphicsResource
+ 		}
++		}
+ 		if (GraphicsDevice.GraphicsCapabilities.SupportsTextureMaxLevel)
+@@ -389,3 +392,3 @@ public class SamplerState : GraphicsResource
+ 			TextureAddressMode.Mirror => 33648, 
+-			TextureAddressMode.Border => 33069, 
++			TextureAddressMode.Border => GL.IsES ? 33071 : 33069, 
+ 			_ => throw new ArgumentException("No support for " + textureAddressMode), 
+diff --git a/Microsoft.Xna.Framework.Graphics/Shader.cs b/Microsoft.Xna.Framework.Graphics/Shader.cs
+index c859766..70fc925 100644
+--- a/Microsoft.Xna.Framework.Graphics/Shader.cs
++++ b/Microsoft.Xna.Framework.Graphics/Shader.cs
+@@ -93,2 +93,52 @@ internal class Shader : GraphicsResource
+ 		HashKey = Hash.ComputeHash(shaderBytecode);
++		if (Dither.Enabled)
++		{
++			if (stage == ShaderStage.Pixel && _glslCode.Contains(SpritePixelOut) && _glslCode.Contains("ps_r0 = ps_r0 * ps_v0;"))
++			{
++				// two programs: the dithered one only while drawing into a 16-bit target, the original everywhere else
++				// (the extra fetch costs GPU time even at zero strength)
++				DitherPlain = (Shader)MemberwiseClone();
++				_glslCode = Dither.PatchPixel(_glslCode);
++				HashKey = Hash.ComputeHash(Encoding.ASCII.GetBytes(_glslCode));
++			}
++			else if (stage == ShaderStage.Vertex && _glslCode.Contains("vs_oT0.xy = vs_v2.xy;") && _glslCode.Contains("posFixup"))
++			{
++				_glslCode = Dither.PatchVertex(_glslCode);
++			}
++		}
++	}
++
++	/// <summary>RG35XX port: the undithered twin of a dithered sprite pixel shader (null for other shaders).</summary>
++	internal Shader DitherPlain;
++
++	private const string SpritePixelOut = "ps_oC0 = ps_r0;";
++
++	/// <summary>RG35XX port: 2x2 ordered dither in the SpriteBatch shaders, for drawing into the RGBA4444 UI target.
++	/// The UI target is 2x the screen (1280x960) and is shrunk by exactly half with linear filtering, which averages each
++	/// 2x2 block: the pattern disappears and the four quantised values average to about two extra bits per channel.
++	/// The vertex shader turns the position into a pattern coordinate (pixel / 2) and the pixel shader reads a 2x2
++	/// repeating texture with it untouched (a prefetched read; gl_FragCoord maths cost 2.5x more GPU time on the SGX).
++	/// The SGX truncates when it writes 16-bit colour, so the shader also rescales (see GraphicsDevice.ApplyDither).
++	/// The RGB565 world target uses the GPU's own dither instead (GL_DITHER, free; it does nothing on RGBA4444).
++	/// Cost on the device: title 55 -> 40 fps uncapped, inventory over the farm 46 -> 39, farm HUD ~0.8 ms.
++	/// MG_DITHER=0 off, ui (default), all = also the 565 target in the shader, show = debug pattern on the backbuffer.</summary>
++	internal static class Dither
++	{
++		internal static readonly string Mode = Environment.GetEnvironmentVariable("MG_DITHER") ?? "ui";
++
++		internal static readonly bool Enabled = Mode != "0";
++
++		internal static string PatchVertex(string code)
++		{
++			code = code.Insert(code.IndexOf("void main()", StringComparison.Ordinal), "uniform vec4 rg_vp;\nvarying vec2 vDither;\n");
++			int end = code.LastIndexOf('}');
++			return code.Insert(end, "\tvDither = (gl_Position.xy / gl_Position.w * 0.5 + 0.5) * rg_vp.xy;\n");
++		}
++
++		internal static string PatchPixel(string code)
++		{
++			const string decl = "#ifdef GL_FRAGMENT_PRECISION_HIGH\nvarying highp vec2 vDither;\n#else\nvarying vec2 vDither;\n#endif\nuniform sampler2D rg_dtex;\nuniform vec4 rg_scale;\nuniform vec4 rg_dither;\nuniform vec4 rg_dbias;\n";
++			code = code.Insert(code.IndexOf("void main()", StringComparison.Ordinal), decl);
++			return code.Replace(SpritePixelOut, "ps_oC0 = ps_r0 * rg_scale + (texture2D(rg_dtex, vDither).xxxx * rg_dither + rg_dbias);");
++		}
+ 	}
+diff --git a/Microsoft.Xna.Framework.Graphics/ShaderProgram.cs b/Microsoft.Xna.Framework.Graphics/ShaderProgram.cs
+index 34b9fc4..cf13e4f 100644
+--- a/Microsoft.Xna.Framework.Graphics/ShaderProgram.cs
++++ b/Microsoft.Xna.Framework.Graphics/ShaderProgram.cs
+@@ -9,2 +9,8 @@ internal class ShaderProgram
+ 
++	/// <summary>RG35XX port: dither strength last set on this program (-1 = never, 0 off, 1 RGBA4444, 2 RGB565).</summary>
++	internal int DitherKind = -1;
++
++	/// <summary>RG35XX port: viewport (w << 16 | h) last given to rg_vp.</summary>
++	internal int DitherViewport = -1;
++
+ 	private readonly Dictionary<string, int> _uniformLocations = new Dictionary<string, int>();
+diff --git a/Microsoft.Xna.Framework.Graphics/SpriteBatch.cs b/Microsoft.Xna.Framework.Graphics/SpriteBatch.cs
+index e82d062..0d424f3 100644
+--- a/Microsoft.Xna.Framework.Graphics/SpriteBatch.cs
++++ b/Microsoft.Xna.Framework.Graphics/SpriteBatch.cs
+@@ -135,2 +135,5 @@ public class SpriteBatch : GraphicsResource
+ 		_beginCalled = false;
++#if RG_PROFILE
++		long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
++#endif
+ 		if (_sortMode != SpriteSortMode.Immediate)
+@@ -140,2 +143,6 @@ public class SpriteBatch : GraphicsResource
+ 		_batcher.DrawBatch(_sortMode, _effect);
++#if RG_PROFILE
++		GraphicsDevice.s_flushTicks += System.Diagnostics.Stopwatch.GetTimestamp() - t0;
++		GraphicsDevice.s_batches++;
++#endif
+ 	}
+diff --git a/Microsoft.Xna.Framework.Graphics/SpriteBatcher.cs b/Microsoft.Xna.Framework.Graphics/SpriteBatcher.cs
+index 69af7ff..69ea2d2 100644
+--- a/Microsoft.Xna.Framework.Graphics/SpriteBatcher.cs
++++ b/Microsoft.Xna.Framework.Graphics/SpriteBatcher.cs
+@@ -1,2 +1,3 @@
+ using System;
++using MonoGame.OpenGL;
+ 
+@@ -128,2 +129,107 @@ internal class SpriteBatcher
+ 	/// <param name="effect">The custom effect to apply to the drawn geometry</param>
++	private long[] _sortKeys;
++
++	/// <summary>RG35XX port: sprite vertices go through one streaming vertex buffer (ring, orphaned on wrap) and a
++	/// static quad index buffer, instead of client-side arrays the driver copies on every draw call
++	/// (~110 draw calls per frame on the farm). MG_SPRITE_VBO=0 restores the original path.</summary>
++	private static readonly bool s_useVbo = GL.UseES && Environment.GetEnvironmentVariable("MG_SPRITE_VBO") == "1";   // measured slower on the SGX driver (End 5.6 -> 9.5 ms): opt-in only
++
++	private const int VboSprites = 2048;
++
++	private DynamicVertexBuffer _vbo;
++
++	private IndexBuffer _ibo;
++
++	private int _vboCursor;
++
++	private unsafe void DrawBatchVbo(Effect effect)
++	{
++		if (_vbo == null || _vbo.IsDisposed)
++		{
++			_vbo = new DynamicVertexBuffer(_device, VertexPositionColorTexture.VertexDeclaration, VboSprites * 4, BufferUsage.WriteOnly);
++			short[] quads = new short[VboSprites * 6];
++			for (int q = 0; q < VboSprites; q++)
++			{
++				quads[q * 6] = (short)(q * 4);
++				quads[q * 6 + 1] = (short)(q * 4 + 1);
++				quads[q * 6 + 2] = (short)(q * 4 + 2);
++				quads[q * 6 + 3] = (short)(q * 4 + 1);
++				quads[q * 6 + 4] = (short)(q * 4 + 3);
++				quads[q * 6 + 5] = (short)(q * 4 + 2);
++			}
++			_ibo = new IndexBuffer(_device, IndexElementSize.SixteenBits, quads.Length, BufferUsage.WriteOnly);
++			_ibo.SetData(quads);
++			_vboCursor = 0;
++		}
++		int stride = VertexPositionColorTexture.VertexDeclaration.VertexStride;
++		int item = 0;
++		int remaining = _batchItemCount;
++		_device._graphicsMetrics._spriteCount += remaining;
++		while (remaining > 0)
++		{
++			int chunk = Math.Min(remaining, VboSprites);
++			fixed (VertexPositionColorTexture* vertexArray = _vertexArray)
++			{
++				VertexPositionColorTexture* ptr = vertexArray;
++				for (int k = 0; k < chunk; k++)
++				{
++					SpriteBatchItem it = _batchItemList[item + k];
++					*ptr = it.vertexTL;
++					ptr[1] = it.vertexTR;
++					ptr[2] = it.vertexBL;
++					ptr[3] = it.vertexBR;
++					ptr += 4;
++				}
++			}
++			SetDataOptions options = SetDataOptions.NoOverwrite;
++			if (_vboCursor + chunk * 4 > VboSprites * 4)
++			{
++				_vboCursor = 0;
++			}
++			if (_vboCursor == 0)
++			{
++				options = SetDataOptions.Discard;
++			}
++			_vbo.SetData(_vboCursor * stride, _vertexArray, 0, chunk * 4, stride, options);
++			_device.SetVertexBuffer(_vbo);
++			_device.Indices = _ibo;
++			int runStart = 0;
++			Texture2D runTexture = _batchItemList[item].Texture;
++			for (int k = 1; k <= chunk; k++)
++			{
++				Texture2D tex = (k < chunk) ? _batchItemList[item + k].Texture : null;
++				if (k == chunk || tex != runTexture)
++				{
++					DrawRun(effect, runTexture, _vboCursor + runStart * 4, (k - runStart) * 2);
++					runStart = k;
++					runTexture = tex;
++				}
++			}
++			for (int k = 0; k < chunk; k++)
++			{
++				_batchItemList[item + k].Texture = null;
++			}
++			_vboCursor += chunk * 4;
++			item += chunk;
++			remaining -= chunk;
++		}
++		_batchItemCount = 0;
++	}
++
++	private void DrawRun(Effect effect, Texture2D texture, int baseVertex, int primitiveCount)
++	{
++		if (effect != null)
++		{
++			foreach (EffectPass pass in effect.CurrentTechnique.Passes)
++			{
++				pass.Apply();
++				_device.Textures[0] = texture;
++				_device.DrawIndexedPrimitives(PrimitiveType.TriangleList, baseVertex, 0, primitiveCount);
++			}
++			return;
++		}
++		_device.Textures[0] = texture;
++		_device.DrawIndexedPrimitives(PrimitiveType.TriangleList, baseVertex, 0, primitiveCount);
++	}
++
+ 	public unsafe void DrawBatch(SpriteSortMode sortMode, Effect effect)
+@@ -140,3 +246,20 @@ internal class SpriteBatcher
+ 		{
+-			Array.Sort(_batchItemList, 0, _batchItemCount);
++			// RG35XX port: sort primitive keys alongside the items instead of IComparable on objects (~1400 sprites
++			// per frame on the farm). Key = sortable float bits << 32 | insertion index: stable, like XNA.
++			if (_sortKeys == null || _sortKeys.Length < _batchItemCount)
++			{
++				_sortKeys = new long[_batchItemList.Length];
++			}
++			for (int i = 0; i < _batchItemCount; i++)
++			{
++				int bits = BitConverter.SingleToInt32Bits(_batchItemList[i].SortKey);
++				bits ^= (bits >> 31) & 0x7FFFFFFF;   // negative floats: reverse order so ints compare like floats
++				_sortKeys[i] = ((long)bits << 32) | (uint)i;
++			}
++			Array.Sort(_sortKeys, _batchItemList, 0, _batchItemCount);
++		}
++		if (s_useVbo)
++		{
++			DrawBatchVbo(effect);
++			return;
+ 		}
+diff --git a/Microsoft.Xna.Framework.Graphics/Tex16.cs b/Microsoft.Xna.Framework.Graphics/Tex16.cs
+new file mode 100644
+index 0000000..d354a44
+--- /dev/null
++++ b/Microsoft.Xna.Framework.Graphics/Tex16.cs
+@@ -0,0 +1,97 @@
++using System;
++using MonoGame.OpenGL;
++
++namespace Microsoft.Xna.Framework.Graphics;
++
++/// <summary>RG35XX port: 32-bit Color textures are stored on the GPU as 16-bit (ES 2.0 packed types), chosen per
++/// upload from the alpha channel: opaque -> RGB565, on/off alpha -> RGBA5551, partial alpha -> RGBA4444.
++/// Halves texture memory; the game still sees SurfaceFormat.Color (uploads are converted, readbacks come back as RGBA8).
++/// MG_TEX16=0 disables it.</summary>
++internal static class Tex16
++{
++	internal const int None = 0, Rgb565 = 1, Rgba5551 = 2, Rgba4444 = 3;
++
++	internal static readonly bool Enabled = Environment.GetEnvironmentVariable("MG_TEX16") != "0";
++
++	internal static int Count565, Count5551, Count4444;
++
++	/// <summary>Assets kept in RGBA8888 (user decision 2026-11-09: smooth gradients in the dialogue box, letters and
++	/// light halos). Exact names match the asset and its localised variants (Cursors.es-ES, not Cursors2); names ending
++	/// in a backslash are folder prefixes. MG_TEX32 overrides the list (comma separated, empty = none).</summary>
++	private static readonly string[] s_keep32 = (Environment.GetEnvironmentVariable("MG_TEX32")
++		?? "LooseSprites\\Cursors,LooseSprites\\textBox,LooseSprites\\letterBG,LooseSprites\\Lighting\\")
++		.Split(',', StringSplitOptions.RemoveEmptyEntries);
++
++	internal static bool Keep32(string asset)
++	{
++		if (asset == null || s_keep32.Length == 0) return false;
++		string name = asset.Replace('/', '\\');
++		foreach (string entry in s_keep32)
++		{
++			if (entry.EndsWith('\\'))
++			{
++				if (name.StartsWith(entry, StringComparison.OrdinalIgnoreCase)) return true;
++			}
++			else if (name.Equals(entry, StringComparison.OrdinalIgnoreCase)
++				|| (name.Length > entry.Length && name[entry.Length] == '.' && name.StartsWith(entry, StringComparison.OrdinalIgnoreCase) && name.IndexOf('\\', entry.Length) < 0))
++			{
++				return true;
++			}
++		}
++		return false;
++	}
++
++	internal static long BytesSaved;
++
++	internal static PixelFormat Format(int mode) => mode == Rgb565 ? PixelFormat.Rgb : PixelFormat.Rgba;
++
++	internal static PixelInternalFormat InternalFormat(int mode) => mode == Rgb565 ? PixelInternalFormat.Rgb : PixelInternalFormat.Rgba;
++
++	internal static PixelType Type(int mode) => mode switch
++	{
++		Rgb565 => PixelType.UnsignedShort565,
++		Rgba5551 => PixelType.UnsignedShort5551,
++		_ => PixelType.UnsignedShort4444,
++	};
++
++	/// <summary>Pick the format for RGBA8 pixels from their alpha values.</summary>
++	internal static unsafe int Choose(byte* rgba, int pixels)
++	{
++		bool opaque = true;
++		for (int i = 0; i < pixels; i++)
++		{
++			byte a = rgba[i * 4 + 3];
++			if (a == 255) continue;
++			opaque = false;
++			if (a != 0) return Rgba4444;
++		}
++		return opaque ? Rgb565 : Rgba5551;
++	}
++
++	/// <summary>Convert RGBA8 pixels to the packed 16-bit layout GL expects (red in the high bits), rounding.</summary>
++	internal static unsafe void Convert(byte* rgba, ushort[] dst, int pixels, int mode)
++	{
++		for (int i = 0; i < pixels; i++)
++		{
++			byte* p = rgba + i * 4;
++			int r = p[0], g = p[1], b = p[2], a = p[3];
++			dst[i] = mode switch
++			{
++				Rgb565 => (ushort)(((r * 31 + 127) / 255) << 11 | ((g * 63 + 127) / 255) << 5 | ((b * 31 + 127) / 255)),
++				Rgba5551 => (ushort)(((r * 31 + 127) / 255) << 11 | ((g * 31 + 127) / 255) << 6 | ((b * 31 + 127) / 255) << 1 | (a >= 128 ? 1 : 0)),
++				_ => (ushort)(((r * 15 + 127) / 255) << 12 | ((g * 15 + 127) / 255) << 8 | ((b * 15 + 127) / 255) << 4 | ((a * 15 + 127) / 255)),
++			};
++		}
++	}
++
++	internal static void Note(int mode, int pixels)
++	{
++		switch (mode)
++		{
++		case Rgb565: Count565++; break;
++		case Rgba5551: Count5551++; break;
++		default: Count4444++; break;
++		}
++		BytesSaved += pixels * 2L;
++	}
++}
+diff --git a/Microsoft.Xna.Framework.Graphics/Texture.cs b/Microsoft.Xna.Framework.Graphics/Texture.cs
+index 2f771a1..10d9247 100644
+--- a/Microsoft.Xna.Framework.Graphics/Texture.cs
++++ b/Microsoft.Xna.Framework.Graphics/Texture.cs
+@@ -18,2 +18,7 @@ public abstract class Texture : GraphicsResource
+ 
++	/// <summary>RG35XX port: frame this texture was last bound for drawing (Present counts frames).</summary>
++	internal int _lastUsedFrame;
++
++	internal static int s_frame;
++
+ 	internal TextureTarget glTarget;
+diff --git a/Microsoft.Xna.Framework.Graphics/Texture2D.cs b/Microsoft.Xna.Framework.Graphics/Texture2D.cs
+index 3e7ed4f..caf4779 100644
+--- a/Microsoft.Xna.Framework.Graphics/Texture2D.cs
++++ b/Microsoft.Xna.Framework.Graphics/Texture2D.cs
+@@ -658,6 +658,95 @@ public class Texture2D : Texture
+ 
++	/// <summary>RG35XX port: asset the content manager is reading on this thread (Tex16.Keep32 decides by name).</summary>
++	[ThreadStatic]
++	internal static string t_loadingAsset;
++
++	/// <summary>RG35XX port: 16-bit GPU storage mode for this Color texture (Tex16), 0 = normal.</summary>
++	internal int _tex16;
++
++	/// <summary>RG35XX port: texture paging. Content textures not drawn for MG_PAGE_IDLE frames (default 900) give
++	/// their GPU memory back; the next bind/readback re-reads the .xnb. Textures the game modifies after loading
++	/// (SetData) are never paged. MG_PAGE=0 disables it.</summary>
++	internal static readonly bool PagingEnabled = Environment.GetEnvironmentVariable("MG_PAGE") != "0";
++
++	internal static readonly int PageIdleFrames = int.TryParse(Environment.GetEnvironmentVariable("MG_PAGE_IDLE"), out int f) && f > 0 ? f : 900;
++
++	/// <summary>Only rarely used menu/title art may page (user playtest 2026-11-09: paging gameplay textures caused
++	/// hitches when they came back). Asset name prefixes, comma separated; MG_PAGE_PREFIXES overrides.</summary>
++	private static readonly string[] s_pagePrefixes = (Environment.GetEnvironmentVariable("MG_PAGE_PREFIXES")
++		?? "Minigames\\,LooseSprites\\ControllerMaps,LooseSprites\\JunimoNote,LooseSprites\\Billboard,LooseSprites\\letterBG,LooseSprites\\Concessions,LooseSprites\\daybg,LooseSprites\\nightbg")
++		.Split(',', StringSplitOptions.RemoveEmptyEntries);
++
++	internal static bool IsPageableAsset(string assetName)
++	{
++		string name = assetName.Replace('/', '\\');
++		foreach (string prefix in s_pagePrefixes)
++		{
++			if (name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
++			{
++				return true;
++			}
++		}
++		return false;
++	}
++
++	internal bool _pageable;
++
++	internal bool _pagedOut;
++
++	internal string _pageRoot;
++
++	internal IServiceProvider _pageServices;
++
++	internal static int s_pagedOutCount, s_pagedInCount;
++
++	internal static long s_pagedOutBytes;
++
++	/// <summary>Free the GPU copy of idle pageable textures (GL thread, from Present).</summary>
++	internal static void PageOutIdle()
++	{
++		lock (s_all)
++		{
++			foreach (var w in s_all)
++			{
++				if (!w.TryGetTarget(out var t) || !t._pageable || t._pagedOut || t.glTexture <= 0 || t.IsDisposed) continue;
++				if (Texture.s_frame - t._lastUsedFrame <= PageIdleFrames) continue;
++				long bytes = (long)t.Width * t.Height * (t._tex16 != 0 ? 2 : t.Format.GetSize());
++				GL.DeleteTextures(1, ref t.glTexture);
++				t.glTexture = -1;
++				t.glLastSamplerState = null;
++				t._pagedOut = true;
++				s_pagedOutCount++;
++				s_pagedOutBytes += bytes;
++			}
++		}
++	}
++
++	/// <summary>Bring a paged-out texture back before it is bound or read (GL thread).</summary>
++	internal void EnsureResident()
++	{
++		if (!_pagedOut) return;
++		_pagedOut = false;
++		var cm = new Microsoft.Xna.Framework.Content.ContentManager(_pageServices, _pageRoot);
++		Texture2D fresh = cm.ReadTextureForPaging(Name);
++		glTexture = fresh.glTexture;
++		_tex16 = fresh._tex16;
++		glLastSamplerState = null;
++		fresh.glTexture = -1;
++		fresh._pageable = false;
++		s_pagedInCount++;
++		s_pagedOutBytes -= (long)Width * Height * (_tex16 != 0 ? 2 : Format.GetSize());
++	}
++
++	/// <summary>RG35XX port: every Texture2D, for the MG_TEX_REPORT memory report.</summary>
++	internal static readonly System.Collections.Generic.List<WeakReference<Texture2D>> s_all = new();
++
+ 	private void PlatformConstruct(int width, int height, bool mipmap, SurfaceFormat format, SurfaceType type, bool shared)
+ 	{
++		lock (s_all) s_all.Add(new WeakReference<Texture2D>(this));
+ 		glTarget = TextureTarget.Texture2D;
+ 		format.GetGLFormat(GraphicsDevice, out glInternalFormat, out glFormat, out glType);
++		if (Tex16.Enabled && GL.IsES && format == SurfaceFormat.Color && type == SurfaceType.Texture && !mipmap && !(this is RenderTarget2D) && !Tex16.Keep32(t_loadingAsset))
++		{
++			_tex16 = Tex16.Rgba4444;   // storage until the first full upload picks the real format
++		}
+ 		Threading.BlockOnUIThread(() =>
+@@ -691,2 +780,6 @@ public class Texture2D : Texture
+ 				}
++				else if (_tex16 != 0)
++				{
++					GL.TexImage2D(TextureTarget.Texture2D, num3, Tex16.InternalFormat(_tex16), num, num2, 0, Tex16.Format(_tex16), Tex16.Type(_tex16), IntPtr.Zero);
++				}
+ 				else
+@@ -714,2 +807,4 @@ public class Texture2D : Texture
+ 	{
++		EnsureResident();
++		_pageable = false;
+ 		Texture.GetSizeForLevel(Width, Height, level, out var w, out var h);
+@@ -730,3 +825,19 @@ public class Texture2D : Texture
+ 				GL.PixelStore(PixelStoreParameter.UnpackAlignment, Math.Min(_format.GetSize(), 8));
+-				if (glFormat == PixelFormat.CompressedTextureFormats)
++				if (_tex16 != 0 && elementCount * num >= w * h * 4)
++				{
++					unsafe
++					{
++						byte* src = (byte*)data2;
++						_tex16 = Tex16.Choose(src, w * h);
++						ushort[] packed = new ushort[w * h];
++						Tex16.Convert(src, packed, w * h, _tex16);
++						GL.PixelStore(PixelStoreParameter.UnpackAlignment, 2);
++						fixed (ushort* q = packed)
++						{
++							GL.TexImage2D(TextureTarget.Texture2D, level, Tex16.InternalFormat(_tex16), w, h, 0, Tex16.Format(_tex16), Tex16.Type(_tex16), (IntPtr)q);
++						}
++						Tex16.Note(_tex16, w * h);
++					}
++				}
++				else if (glFormat == PixelFormat.CompressedTextureFormats)
+ 				{
+@@ -753,2 +864,4 @@ public class Texture2D : Texture
+ 	{
++		EnsureResident();
++		_pageable = false;
+ 		Threading.BlockOnUIThread(() =>
+@@ -768,3 +881,17 @@ public class Texture2D : Texture
+ 				GL.PixelStore(PixelStoreParameter.UnpackAlignment, Math.Min(_format.GetSize(), 8));
+-				if (glFormat == PixelFormat.CompressedTextureFormats)
++				if (_tex16 != 0)
++				{
++					unsafe
++					{
++						int px = rect.Width * rect.Height;
++						ushort[] packed = new ushort[px];
++						Tex16.Convert((byte*)data2, packed, px, _tex16);
++						GL.PixelStore(PixelStoreParameter.UnpackAlignment, 2);
++						fixed (ushort* q = packed)
++						{
++							GL.TexSubImage2D(TextureTarget.Texture2D, level, rect.X, rect.Y, rect.Width, rect.Height, Tex16.Format(_tex16), Tex16.Type(_tex16), (IntPtr)q);
++						}
++					}
++				}
++				else if (glFormat == PixelFormat.CompressedTextureFormats)
+ 				{
+@@ -792,3 +919,9 @@ public class Texture2D : Texture
+ 		Threading.EnsureUIThread();
++		EnsureResident();
+ 		int num = ReflectionHelpers.SizeOf<T>.Get();
++		if (GL.IsES)
++		{
++			PlatformGetDataES(level, rect, data, startIndex, elementCount, num);
++			return;
++		}
+ 		GL.BindTexture(TextureTarget.Texture2D, glTexture);
+@@ -827,2 +960,51 @@ public class Texture2D : Texture
+ 
++	/// <summary>ES 2.0 has no glGetTexImage: attach the texture to a temporary framebuffer and read it back
++	/// (stock MonoGame GLES path, plus restoring the caller's framebuffer and honouring startIndex).</summary>
++	private void PlatformGetDataES<T>(int level, Rectangle rect, T[] data, int startIndex, int elementCount, int tSize) where T : struct
++	{
++		GL.GetInteger(GetPName.FramebufferBinding, out int previous);
++		GL.GenFramebuffers(1, out int fb);
++		GL.BindFramebuffer(FramebufferTarget.Framebuffer, fb);
++		GL.FramebufferTexture2D(FramebufferTarget.Framebuffer, FramebufferAttachment.ColorAttachment0, TextureTarget.Texture2D, glTexture, level);
++		GL.PixelStore(PixelStoreParameter.PackAlignment, 1);
++		int bytes = rect.Width * rect.Height * Format.GetSize();
++		if (startIndex == 0 && elementCount * tSize == bytes && data.Length * tSize >= bytes)
++		{
++			GL.ReadPixels(rect.X, rect.Y, rect.Width, rect.Height, _tex16 != 0 ? PixelFormat.Rgba : glFormat, _tex16 != 0 ? PixelType.UnsignedByte : glType, data);
++		}
++		else
++		{
++			T[] temp = new T[(bytes + tSize - 1) / tSize];
++			GL.ReadPixels(rect.X, rect.Y, rect.Width, rect.Height, _tex16 != 0 ? PixelFormat.Rgba : glFormat, _tex16 != 0 ? PixelType.UnsignedByte : glType, temp);
++			Array.Copy(temp, 0, data, startIndex, elementCount);
++		}
++		GL.BindFramebuffer(FramebufferTarget.Framebuffer, previous);
++		GL.DeleteFramebuffers(1, ref fb);
++	}
++
++	/// <summary>RG35XX port: GPU bytes of all live textures, bytes drawn in the last idleFrames frames, top entries.</summary>
++	internal static string MemoryReport(int idleFrames, int top)
++	{
++		var rows = new System.Collections.Generic.List<(long bytes, string text, bool used)>();
++		long total = 0, used = 0;
++		lock (s_all)
++		{
++			s_all.RemoveAll(w => !w.TryGetTarget(out var t) || t.IsDisposed);
++			foreach (var w in s_all)
++			{
++				if (!w.TryGetTarget(out var t) || t.glTexture <= 0) continue;
++				long bytes = (long)t.Width * t.Height * (t._tex16 != 0 ? 2 : t.Format.GetSize()) * (t.LevelCount > 1 ? 4 : 3) / 3;
++				bool recent = Texture.s_frame - t._lastUsedFrame <= idleFrames;
++				total += bytes;
++				if (recent) used += bytes;
++				rows.Add((bytes, $"{bytes / 1024,6} KB {t.Width}x{t.Height} {(t is RenderTarget2D ? "RT " + t.Format : t._tex16 != 0 ? "16b" + t._tex16 : t.Format.ToString())} idle {Texture.s_frame - t._lastUsedFrame} {t.Name}", recent));
++			}
++		}
++		rows.Sort((a, b) => b.bytes.CompareTo(a.bytes));
++		var sb = new System.Text.StringBuilder();
++		sb.Append($"[tex] {rows.Count} textures, {total / 1048576.0:F1} MB on GPU, {used / 1048576.0:F1} MB drawn in the last {idleFrames} frames; paged out {s_pagedOutCount} (now {s_pagedOutBytes / 1048576.0:F1} MB off GPU), paged in {s_pagedInCount}\n");
++		for (int i = 0; i < Math.Min(top, rows.Count); i++) sb.Append("[tex] ").Append(rows[i].text).Append('\n');
++		return sb.ToString();
++	}
++
+ 	private void FillTextureFromStream(Stream stream)
+@@ -856,3 +1038,6 @@ public class Texture2D : Texture
+ 		GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapT, (int)value);
+-		GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureBaseLevel, 0);
++		if (!GL.IsES)
++		{
++			GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureBaseLevel, 0);
++		}
+ 		if (GraphicsDevice.GraphicsCapabilities.SupportsTextureMaxLevel)
+diff --git a/Microsoft.Xna.Framework.Graphics/TextureCollection.cs b/Microsoft.Xna.Framework.Graphics/TextureCollection.cs
+index ec15cfe..3a28ce0 100644
+--- a/Microsoft.Xna.Framework.Graphics/TextureCollection.cs
++++ b/Microsoft.Xna.Framework.Graphics/TextureCollection.cs
+@@ -98,2 +98,6 @@ public sealed class TextureCollection
+ 				GL.ActiveTexture((TextureUnit)(33984 + i));
++				if (i == 1)
++				{
++					GraphicsDevice.DitherTextureLost = true;   // RG35XX port: unit 1 holds the dither pattern
++				}
+ 				if (_targets[i] != 0 && (texture == null || _targets[i] != texture.glTarget))
+@@ -105,3 +109,5 @@ public sealed class TextureCollection
+ 				{
++					(texture as Texture2D)?.EnsureResident();
+ 					_targets[i] = texture.glTarget;
++					texture._lastUsedFrame = Texture.s_frame;
+ 					GL.BindTexture(texture.glTarget, texture.glTexture);
+diff --git a/Microsoft.Xna.Framework.Graphics/VertexBuffer.cs b/Microsoft.Xna.Framework.Graphics/VertexBuffer.cs
+index 443b40a..c0605f0 100644
+--- a/Microsoft.Xna.Framework.Graphics/VertexBuffer.cs
++++ b/Microsoft.Xna.Framework.Graphics/VertexBuffer.cs
+@@ -310,3 +310,3 @@ public class VertexBuffer : GraphicsResource
+ 		}
+-		int num = Marshal.SizeOf(typeof(T));
++		int num = System.Runtime.CompilerServices.Unsafe.SizeOf<T>();
+ 		if (num == vertexStride || num % vertexStride == 0)
+diff --git a/Microsoft.Xna.Framework/Game.cs b/Microsoft.Xna.Framework/Game.cs
+index 2a0b0e2..66bff4d 100644
+--- a/Microsoft.Xna.Framework/Game.cs
++++ b/Microsoft.Xna.Framework/Game.cs
+@@ -1037,2 +1037,5 @@ public class Game : IDisposable
+ 		{
++#if RG_PROFILE
++			long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
++#endif
+ 			FrameworkDispatcher.Update();
+@@ -1040,2 +1043,6 @@ public class Game : IDisposable
+ 			TouchPanelState.CurrentTimestamp = gameTime.TotalGameTime;
++#if RG_PROFILE
++			GraphicsDevice.s_updateTicks += System.Diagnostics.Stopwatch.GetTimestamp() - t0;
++			GraphicsDevice.s_updates++;
++#endif
+ 		}
+@@ -1048,3 +1055,9 @@ public class Game : IDisposable
+ 		{
++#if RG_PROFILE
++			long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
++#endif
+ 			Draw(gameTime);
++#if RG_PROFILE
++			GraphicsDevice.s_drawTicks += System.Diagnostics.Stopwatch.GetTimestamp() - t0;
++#endif
+ 			EndDraw();
+diff --git a/Microsoft.Xna.Framework/GraphicsDeviceManager.cs b/Microsoft.Xna.Framework/GraphicsDeviceManager.cs
+index 2aff95f..c0e6042 100644
+--- a/Microsoft.Xna.Framework/GraphicsDeviceManager.cs
++++ b/Microsoft.Xna.Framework/GraphicsDeviceManager.cs
+@@ -51,2 +51,19 @@ public class GraphicsDeviceManager : IGraphicsDeviceService, IDisposable, IGraph
+ 
++	/// <summary>RG35XX port: the backbuffer and window always match the display (640x480 on ARM by default;
++	/// MG_DISPLAY_SIZE=WxH overrides, MG_DISPLAY_SIZE=0 disables).</summary>
++	internal static readonly Point? FixedDisplaySize = ParseDisplaySize();
++
++	private static Point? ParseDisplaySize()
++	{
++		string s = Environment.GetEnvironmentVariable("MG_DISPLAY_SIZE");
++		if (s == "0") return null;
++		if (!string.IsNullOrEmpty(s))
++		{
++			string[] p = s.ToLowerInvariant().Split('x');
++			if (p.Length == 2 && int.TryParse(p[0], out int w) && int.TryParse(p[1], out int h)) return new Point(w, h);
++		}
++		var arch = System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture;
++		return arch == System.Runtime.InteropServices.Architecture.Arm || arch == System.Runtime.InteropServices.Architecture.Arm64 ? new Point(640, 480) : null;
++	}
++
+ 	/// <summary>
+@@ -202,3 +219,3 @@ public class GraphicsDeviceManager : IGraphicsDeviceService, IDisposable, IGraph
+ 			_shouldApplyChanges = true;
+-			_preferredBackBufferHeight = value;
++			_preferredBackBufferHeight = FixedDisplaySize?.Y ?? value;
+ 		}
+@@ -222,3 +239,3 @@ public class GraphicsDeviceManager : IGraphicsDeviceService, IDisposable, IGraph
+ 			_shouldApplyChanges = true;
+-			_preferredBackBufferWidth = value;
++			_preferredBackBufferWidth = FixedDisplaySize?.X ?? value;
+ 		}
+@@ -507,2 +524,7 @@ public class GraphicsDeviceManager : IGraphicsDeviceService, IDisposable, IGraph
+ 		presentationParameters.BackBufferFormat = _preferredBackBufferFormat;
++		if (FixedDisplaySize.HasValue)
++		{
++			_preferredBackBufferWidth = FixedDisplaySize.Value.X;
++			_preferredBackBufferHeight = FixedDisplaySize.Value.Y;
++		}
+ 		presentationParameters.BackBufferWidth = _preferredBackBufferWidth;
+@@ -595,4 +617,13 @@ public class GraphicsDeviceManager : IGraphicsDeviceService, IDisposable, IGraph
+ 		Sdl.GL.SetAttribute(Sdl.GL.Attribute.DoubleBuffer, 1);
+-		Sdl.GL.SetAttribute(Sdl.GL.Attribute.ContextMajorVersion, 2);
+-		Sdl.GL.SetAttribute(Sdl.GL.Attribute.ContextMinorVersion, 1);
++		if (GL.UseES)
++		{
++			Sdl.GL.SetAttribute(Sdl.GL.Attribute.ContextProfileMAsl, 4);   // SDL_GL_CONTEXT_PROFILE_ES
++			Sdl.GL.SetAttribute(Sdl.GL.Attribute.ContextMajorVersion, 2);
++			Sdl.GL.SetAttribute(Sdl.GL.Attribute.ContextMinorVersion, 0);
++		}
++		else
++		{
++			Sdl.GL.SetAttribute(Sdl.GL.Attribute.ContextMajorVersion, 2);
++			Sdl.GL.SetAttribute(Sdl.GL.Attribute.ContextMinorVersion, 1);
++		}
+ 		((SdlGameWindow)SdlGameWindow.Instance).CreateWindow();
+diff --git a/Microsoft.Xna.Framework/SdlGameWindow.cs b/Microsoft.Xna.Framework/SdlGameWindow.cs
+index 3831004..4c7e85a 100644
+--- a/Microsoft.Xna.Framework/SdlGameWindow.cs
++++ b/Microsoft.Xna.Framework/SdlGameWindow.cs
+@@ -82,2 +82,6 @@ internal class SdlGameWindow : GameWindow, IDisposable
+ 			Sdl.Window.GetPosition(Handle, out x, out y);
++			if (GraphicsDeviceManager.FixedDisplaySize.HasValue)
++			{
++				return new Rectangle(0, 0, GraphicsDeviceManager.FixedDisplaySize.Value.X, GraphicsDeviceManager.FixedDisplaySize.Value.Y);
++			}
+ 			return new Rectangle(x, y, _width, _height);
+@@ -129,4 +133,4 @@ internal class SdlGameWindow : GameWindow, IDisposable
+ 		Instance = this;
+-		_width = GraphicsDeviceManager.DefaultBackBufferWidth;
+-		_height = GraphicsDeviceManager.DefaultBackBufferHeight;
++		_width = GraphicsDeviceManager.FixedDisplaySize?.X ?? GraphicsDeviceManager.DefaultBackBufferWidth;
++		_height = GraphicsDeviceManager.FixedDisplaySize?.Y ?? GraphicsDeviceManager.DefaultBackBufferHeight;
+ 		Sdl.SetHint("SDL_VIDEO_MINIMIZE_ON_FOCUS_LOSS", "0");
+diff --git a/MonoGame.Framework.Utilities/ByteBufferPool.cs b/MonoGame.Framework.Utilities/ByteBufferPool.cs
+index 7d9a165..0aae60f 100644
+--- a/MonoGame.Framework.Utilities/ByteBufferPool.cs
++++ b/MonoGame.Framework.Utilities/ByteBufferPool.cs
+@@ -14,2 +14,5 @@ internal class ByteBufferPool
+ 
++	/// <summary>Largest buffer kept for reuse (MG_POOL_MAX bytes, default 1 MB).</summary>
++	private static readonly int s_maxPooled = int.TryParse(System.Environment.GetEnvironmentVariable("MG_POOL_MAX"), out int v) && v > 0 ? v : 1 << 20;
++
+ 	public ByteBufferPool(int minBufferSize = 0, int maxBuffers = int.MaxValue)
+@@ -56,2 +59,7 @@ internal class ByteBufferPool
+ 	{
++		// RG35XX port: never keep huge buffers (the content pool held a 10 MB one, sized for the biggest texture, forever)
++		if (buffer.Length > s_maxPooled)
++		{
++			return;
++		}
+ 		lock (_freeBuffers)
+diff --git a/MonoGame.OpenGL/GL.cs b/MonoGame.OpenGL/GL.cs
+index 3f188e0..dfb058a 100644
+--- a/MonoGame.OpenGL/GL.cs
++++ b/MonoGame.OpenGL/GL.cs
+@@ -559,2 +559,13 @@ internal class GL
+ 
++	/// <summary>RG35XX port: OpenGL ES 2.0 instead of desktop GL 2.1. On by default on ARM, MG_GLES=1/0 overrides
++	/// (MG_GLES=1 on the PC tests the ES path with Mesa).</summary>
++	internal static readonly bool UseES = Environment.GetEnvironmentVariable("MG_GLES") switch
++	{
++		"1" => true,
++		"0" => false,
++		_ => RuntimeInformation.ProcessArchitecture == Architecture.Arm || RuntimeInformation.ProcessArchitecture == Architecture.Arm64
++	};
++
++	internal static bool IsES => BoundApi == RenderApi.ES;
++
+ 	private const CallingConvention callingConvention = CallingConvention.Winapi;
+@@ -1012,3 +1023,3 @@ internal class GL
+ 	{
+-		BoundApi = RenderApi.GL;
++		BoundApi = UseES ? RenderApi.ES : RenderApi.GL;
+ 	}
+diff --git a/MonoGame.OpenGL/GetPName.cs b/MonoGame.OpenGL/GetPName.cs
+index 720873a..d43c858 100644
+--- a/MonoGame.OpenGL/GetPName.cs
++++ b/MonoGame.OpenGL/GetPName.cs
+@@ -12,3 +12,4 @@ internal enum GetPName
+ 	MaxTextureMaxAnisotropyExt = 34047,
+-	MaxSamples = 36183
++	MaxSamples = 36183,
++	FramebufferBinding = 36006
+ }
+diff --git a/MonoGame.OpenGL/GraphicsContext.cs b/MonoGame.OpenGL/GraphicsContext.cs
+index 3e4eb7e..45790c8 100644
+--- a/MonoGame.OpenGL/GraphicsContext.cs
++++ b/MonoGame.OpenGL/GraphicsContext.cs
+@@ -21,3 +21,3 @@ internal class GraphicsContext : IGraphicsContext, IDisposable
+ 		{
+-			Sdl.GL.SetSwapInterval(value);
++			Sdl.GL.SetSwapInterval(System.Environment.GetEnvironmentVariable("MG_VSYNC") == "0" ? 0 : value);   // RG35XX tests: MG_VSYNC=0
+ 		}
